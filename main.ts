@@ -78,8 +78,11 @@ export default class PDFToMarkdownPlugin extends Plugin {
         // ノートのタイトル（拡張子なし）を取得
         const noteTitle = activeFile.basename;
         
+        // 接頭辞「【Note】」を除いてPDFの名前を取得
+        const pdfBaseName = noteTitle.replace(/^【Note】/, '');
+        
         // 対応するPDFのファイル名
-        const targetPdfName = `${noteTitle}.pdf`;
+        const targetPdfName = `${pdfBaseName}.pdf`;
         
         // Vault内からPDFを検索
         const pdfFile = this.app.vault.getFiles().find(
@@ -91,9 +94,9 @@ export default class PDFToMarkdownPlugin extends Plugin {
           return;
         }
 
-        // 出力先のフルパスを構築
+        // 出力先のフルパスを構築（接頭辞なしの名前で出力）
         const mdFolder = this.settings.markdownOutputFolder.trim();
-        const targetMdName = `${noteTitle}.md`;
+        const targetMdName = `${pdfBaseName}.md`;
         const targetMdPath = mdFolder ? `${mdFolder}/${targetMdName}` : targetMdName;
 
         // 出力先パスで存在確認（ファイル名だけでなくパス全体でチェック）
