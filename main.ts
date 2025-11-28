@@ -63,6 +63,57 @@ export default class PDFToMarkdownPlugin extends Plugin {
         }
     });
 
+    // コマンド: 現在のノート名に対応するPDFを処理（Meta Bind連携用）
+    this.addCommand({
+      id: 'process-pdf-by-note-title',
+      name: 'Process PDF matching current note title',
+      callback: async () => {
+        // 現在アクティブなファイルを取得
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+          new Notice('No active file found.');
+          return;
+        }
+
+        // ノートのタイトル（拡張子なし）を取得
+        const noteTitle = activeFile.basename;
+        
+        // 対応するPDFのファイル名
+        const targetPdfName = `${noteTitle}.pdf`;
+        
+        // Vault内からPDFを検索
+        const pdfFile = this.app.vault.getFiles().find(
+          file => file.name === targetPdfName
+        );
+
+        if (!pdfFile) {
+          new Notice(`PDF not found: ${targetPdfName}`);
+          return;
+        }
+
+        // 出力先のフルパスを構築
+        const mdFolder = this.settings.markdownOutputFolder.trim();
+        const targetMdName = `${noteTitle}.md`;
+        const targetMdPath = mdFolder ? `${mdFolder}/${targetMdName}` : targetMdName;
+
+        // 出力先パスで存在確認（ファイル名だけでなくパス全体でチェック）
+        const existingFile = this.app.vault.getAbstractFileByPath(targetMdPath);
+
+        if (existingFile) {
+          new Notice(`Markdown already exists: ${targetMdPath}`);
+          return;
+        }
+
+        // PDFを処理（Noticeは processPDFfromTFile 内で表示される）
+        try {
+          await this.processPDFfromTFile(pdfFile);
+        } catch (err) {
+          console.error(err);
+          new Notice(`Failed to process: ${targetPdfName}`);
+        }
+      }
+    });
+
     // 設定タブ
     this.addSettingTab(new PDFToMarkdownSettingTab(this.app, this));
   }
@@ -112,17 +163,18 @@ export default class PDFToMarkdownPlugin extends Plugin {
    * Mistral APIを使ってPDFをOCRする共通の内部ロジック
    */
   async processPDFInternal(pdfContent: ArrayBuffer, pdfBaseName: string, originalFileName: string): Promise<void> {
-    // ★★★★★ ここからが修正箇所 ★★★★★
-    // 安全装置：処理の最初に、同名ファイルがVault内に存在しないか最終チェック
+    // 出力先のフルパスを構築して存在確認
+    const mdFolder = this.settings.markdownOutputFolder.trim();
     const targetMdName = `${pdfBaseName}.md`;
-    const existingMdFile = this.app.vault.getMarkdownFiles().find(f => f.name === targetMdName);
+    const targetMdPath = mdFolder ? `${mdFolder}/${targetMdName}` : targetMdName;
+    
+    const existingMdFile = this.app.vault.getAbstractFileByPath(targetMdPath);
 
     if (existingMdFile) {
       // ファイルが既に存在する場合、上書きを防ぐために処理を中断し、ユーザーに通知
-      new Notice(`Error: "${targetMdName}" already exists. Processing stopped.`, 7000);
+      new Notice(`Error: "${targetMdPath}" already exists. Processing stopped.`, 7000);
       return;
     }
-    // ★★★★★ ここまでが修正箇所 ★★★★★
 
     const apiKey = this.settings.mistralApiKey.trim();
     if (!apiKey) {
@@ -161,7 +213,7 @@ export default class PDFToMarkdownPlugin extends Plugin {
       console.error(`Error during OCR process for file: ${originalFileName}`, err);
       throw err;
     }
-    const mdFolder = this.settings.markdownOutputFolder.trim();
+    // mdFolder は既に上で定義済み
     if (mdFolder) {
       await this.createFolderIfNotExists(mdFolder);
     }
