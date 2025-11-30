@@ -37,6 +37,9 @@ interface PDFToMarkdownSettings {
   // 一括処理時の最大並列実行数
   parallelProcessingLimit: number;
 
+  // AI要約用のシステムプロンプト（全プロンプト共通の指示）
+  summarySystemPrompt: string;
+
   // AI要約用のプロンプト設定
   summaryPrompts: SummaryPromptItem[];
 }
@@ -61,6 +64,7 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   imagesFolderName: 'pdf-mistral-images',
   mistralApiKey: '',
   parallelProcessingLimit: 3,
+  summarySystemPrompt: '見出し記号（#）は使わずに回答してください。',
   summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
 
@@ -496,15 +500,19 @@ export default class PDFToMarkdownPlugin extends Plugin {
 
       new Notice(`処理中 (${i + 1}/${validMatches.length}): ${key.substring(0, 30)}...`);
 
+      // システムプロンプトを取得
+      const systemPrompt = this.settings.summarySystemPrompt.trim();
+      const systemPromptSection = systemPrompt ? `【指示】\n${systemPrompt}\n\n` : '';
+
       // プロンプトを構築
       let promptText: string;
       
       if (i === 0) {
         // 最初のプロンプト：PDF内容をコンテキストとして含める
-        promptText = `以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${srcContent}\n---\n\n【質問】\n${userInstruction}`;
+        promptText = `${systemPromptSection}以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${srcContent}\n---\n\n【質問】\n${userInstruction}`;
       } else {
         // 2番目以降：会話履歴を含めて送信
-        let historyText = '以下はこれまでの会話履歴です。この文脈を踏まえて次の質問に回答してください。\n\n';
+        let historyText = `${systemPromptSection}以下はこれまでの会話履歴です。この文脈を踏まえて次の質問に回答してください。\n\n`;
         for (const msg of conversationHistory) {
           if (msg.role === 'user') {
             historyText += `【質問】\n${msg.content}\n\n`;
@@ -774,6 +782,24 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
       text: 'ノート内の <!-- Key Comment --> をAIで置き換える際のプロンプトを設定します。',
       cls: 'setting-item-description'
     });
+
+    // システムプロンプト設定
+    const systemPromptSetting = new Setting(containerEl)
+      .setName('System Prompt')
+      .setDesc('全てのプロンプトに共通で適用される指示（例：見出し記号は使わない、など）');
+    
+    const systemPromptTextarea = systemPromptSetting.controlEl.createEl('textarea');
+    systemPromptTextarea.value = this.plugin.settings.summarySystemPrompt;
+    systemPromptTextarea.placeholder = '例: 見出し記号（#）は使わずに回答してください。';
+    systemPromptTextarea.style.width = '100%';
+    systemPromptTextarea.style.minHeight = '80px';
+    systemPromptTextarea.style.resize = 'vertical';
+    systemPromptTextarea.addEventListener('change', async () => {
+      this.plugin.settings.summarySystemPrompt = systemPromptTextarea.value;
+      await this.plugin.saveSettings();
+    });
+
+    containerEl.createEl('hr');
 
     // プロンプト一覧を表示するコンテナ
     const promptsContainer = containerEl.createDiv({ cls: 'summary-prompts-container' });
