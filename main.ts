@@ -474,16 +474,47 @@ export default class PDFToMarkdownPlugin extends Plugin {
       return;
     }
 
-    new Notice(`AI要約を開始: ${validMatches.length}件のキーを処理`);
+    new Notice(`AI要約を開始: ${validMatches.length}件のキーを会話形式で処理`);
 
-    // 各キーを処理
-    for (const matchInfo of validMatches) {
+    // 会話履歴を保持（マルチターン会話用）
+    const conversationHistory: { role: 'user' | 'assistant'; content: string }[] = [];
+
+    // 設定のプロンプト順序を維持するため、設定順にvalidMatchesをソート
+    const promptOrder = this.settings.summaryPrompts.map(p => p.keyComment);
+    validMatches.sort((a, b) => {
+      const indexA = promptOrder.indexOf(a.key);
+      const indexB = promptOrder.indexOf(b.key);
+      return indexA - indexB;
+    });
+
+    // 各キーを順番に処理（会話形式）
+    for (let i = 0; i < validMatches.length; i++) {
+      const matchInfo = validMatches[i];
       const fullComment = matchInfo.fullMatch;       // <!-- キー --> 全体
       const key = matchInfo.key;                     // キー名
       const userInstruction = promptMap[key];        // 対応するプロンプト
 
-      // プロンプト作成（定義済みプロンプト + 要約元の内容）
-      const promptText = `${userInstruction}\n\n---\n\n${srcContent}`;
+      new Notice(`処理中 (${i + 1}/${validMatches.length}): ${key.substring(0, 30)}...`);
+
+      // プロンプトを構築
+      let promptText: string;
+      
+      if (i === 0) {
+        // 最初のプロンプト：PDF内容をコンテキストとして含める
+        promptText = `以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${srcContent}\n---\n\n【質問】\n${userInstruction}`;
+      } else {
+        // 2番目以降：会話履歴を含めて送信
+        let historyText = '以下はこれまでの会話履歴です。この文脈を踏まえて次の質問に回答してください。\n\n';
+        for (const msg of conversationHistory) {
+          if (msg.role === 'user') {
+            historyText += `【質問】\n${msg.content}\n\n`;
+          } else {
+            historyText += `【回答】\n${msg.content}\n\n`;
+          }
+        }
+        historyText += `---\n\n【次の質問】\n${userInstruction}`;
+        promptText = historyText;
+      }
 
       // AI 要約を生成
       let result;
@@ -497,13 +528,17 @@ export default class PDFToMarkdownPlugin extends Plugin {
       // 結果を取得
       const summaryText = result?.text ?? result?.content ?? result ?? '';
 
+      // 会話履歴に追加（次のプロンプトで使用）
+      conversationHistory.push({ role: 'user', content: userInstruction });
+      conversationHistory.push({ role: 'assistant', content: summaryText });
+
       // コメント部分を要約で置き換え
       noteContent = noteContent.replace(fullComment, summaryText);
     }
 
     // 全ての置換が終わったらファイルを保存
     await this.app.vault.modify(activeFile, noteContent);
-    new Notice(`要約が完了しました！（${validMatches.length}件処理）`);
+    new Notice(`要約が完了しました！（${validMatches.length}件を会話形式で処理）`);
   }
 }
 
