@@ -827,12 +827,16 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
     // デフォルトにリセットボタン
     new Setting(containerEl)
       .setName('Reset to Defaults')
-      .setDesc('プロンプト設定をデフォルトに戻します')
+      .setDesc('システムプロンプトとプロンプト設定をデフォルトに戻します')
       .addButton(button => {
         button
           .setButtonText('Reset')
           .setWarning()
           .onClick(async () => {
+            // システムプロンプトをデフォルトに戻す
+            this.plugin.settings.summarySystemPrompt = DEFAULT_SETTINGS.summarySystemPrompt;
+            systemPromptTextarea.value = this.plugin.settings.summarySystemPrompt;
+            
             // 深いコピーでデフォルト値を復元（元のオブジェクトを変更しないため）
             this.plugin.settings.summaryPrompts = DEFAULT_SUMMARY_PROMPTS.map(item => ({
               keyComment: item.keyComment,
@@ -840,7 +844,7 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
             }));
             await this.plugin.saveSettings();
             this.renderPromptsList(promptsContainer);
-            new Notice('プロンプト設定をデフォルトにリセットしました');
+            new Notice('システムプロンプトとプロンプト設定をデフォルトにリセットしました');
           });
       });
   }
