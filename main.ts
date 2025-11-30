@@ -352,7 +352,16 @@ export default class PDFToMarkdownPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const savedData = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, savedData);
+    
+    // summaryPromptsが未設定または空の場合、デフォルトを深いコピーで設定
+    if (!this.settings.summaryPrompts || this.settings.summaryPrompts.length === 0) {
+      this.settings.summaryPrompts = DEFAULT_SUMMARY_PROMPTS.map(item => ({
+        keyComment: item.keyComment,
+        prompt: item.prompt
+      }));
+    }
   }
 
   async saveSettings() {
@@ -763,7 +772,11 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
           .setButtonText('Reset')
           .setWarning()
           .onClick(async () => {
-            this.plugin.settings.summaryPrompts = [...DEFAULT_SUMMARY_PROMPTS];
+            // 深いコピーでデフォルト値を復元（元のオブジェクトを変更しないため）
+            this.plugin.settings.summaryPrompts = DEFAULT_SUMMARY_PROMPTS.map(item => ({
+              keyComment: item.keyComment,
+              prompt: item.prompt
+            }));
             await this.plugin.saveSettings();
             this.renderPromptsList(promptsContainer);
             new Notice('プロンプト設定をデフォルトにリセットしました');
