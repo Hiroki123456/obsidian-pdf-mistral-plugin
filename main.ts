@@ -64,7 +64,7 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   imagesFolderName: 'pdf-mistral-images',
   mistralApiKey: '',
   parallelProcessingLimit: 3,
-  summarySystemPrompt: '見出し記号（#）は使わずに回答してください。',
+  summarySystemPrompt: '見出し記号（#）は使わずに回答してください。\n前置き文（「〜について説明します」「以下に述べます」など）は省略し、直接内容を回答してください。',
   summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
 
