@@ -417,7 +417,6 @@ export default class PDFToMarkdownPlugin extends Plugin {
         return;
       }
 
-      new Notice(`OCR処理を開始: ${targetPdfName}`);
       try {
         await this.processPDFfromTFile(pdfFile);
       } catch (err) {
