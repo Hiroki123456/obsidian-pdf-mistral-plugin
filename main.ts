@@ -10,6 +10,14 @@ interface InlineImageMap {
 }
 
 /**
+ * AI要約用のプロンプト設定
+ */
+interface SummaryPromptItem {
+  keyComment: string;  // <!-- キー --> で使用するキー
+  prompt: string;      // AIに送信するプロンプト
+}
+
+/**
  * プラグインの設定項目
  */
 interface PDFToMarkdownSettings {
@@ -28,7 +36,21 @@ interface PDFToMarkdownSettings {
 
   // 一括処理時の最大並列実行数
   parallelProcessingLimit: number;
+
+  // AI要約用のプロンプト設定
+  summaryPrompts: SummaryPromptItem[];
 }
+
+/**
+ * デフォルトのAI要約プロンプト
+ */
+const DEFAULT_SUMMARY_PROMPTS: SummaryPromptItem[] = [
+  { keyComment: "AIに論文の要約を生成してもらう。下記の部分はAIに置き換えてもらう", prompt: "この論文を要約してください。" },
+  { keyComment: "研究が行われた背景と主な目的について", prompt: "この研究が行われた背景と主な目的について詳細に教えてください。" },
+  { keyComment: "研究で使用された方法論、実験設計、分析手法について", prompt: "この研究で使用された方法論、実験設計、分析手法について詳細に教えてください。" },
+  { keyComment: "研究から得られた主要な結果と知見について", prompt: "この研究から得られた主要な結果と知見について詳細に教えてください。" },
+  { keyComment: "著者が述べている結論と、この研究の学術的・実用的意義について", prompt: "本著者が述べている結論と、この研究の学術的・実用的意義について詳細に教えてください。" },
+];
 
 /**
  * 設定項目のデフォルト値
@@ -39,6 +61,7 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   imagesFolderName: 'pdf-mistral-images',
   mistralApiKey: '',
   parallelProcessingLimit: 3,
+  summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
 
 export default class PDFToMarkdownPlugin extends Plugin {
@@ -114,6 +137,15 @@ export default class PDFToMarkdownPlugin extends Plugin {
           console.error(err);
           new Notice(`Failed to process: ${targetPdfName}`);
         }
+      }
+    });
+
+    // コマンド: PDFをOCR処理した後、AI要約を生成
+    this.addCommand({
+      id: 'process-pdf-and-summarize',
+      name: 'Process PDF and generate AI summary',
+      callback: async () => {
+        await this.processPdfAndSummarize();
       }
     });
 
@@ -314,7 +346,9 @@ export default class PDFToMarkdownPlugin extends Plugin {
       return;
     }
     const buffer = Buffer.from(matches[1], "base64");
-    await this.app.vault.adapter.writeBinary(filePath, buffer);
+    // BufferをArrayBufferに変換
+    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    await this.app.vault.adapter.writeBinary(filePath, arrayBuffer);
   }
 
   async loadSettings() {
@@ -323,6 +357,144 @@ export default class PDFToMarkdownPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /**
+   * PDFをOCR処理した後、AI要約を生成してノートを更新する
+   */
+  async processPdfAndSummarize(): Promise<void> {
+    // 現在アクティブなファイル（要約先ノート）を取得
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile) {
+      new Notice('アクティブなファイルがありません');
+      return;
+    }
+
+    // ノートのタイトル（拡張子なし）を取得
+    const noteTitle = activeFile.basename;
+    
+    // 接頭辞「【Note】」を除いてPDF/要約元の名前を取得
+    const srcBaseName = noteTitle.replace(/^【Note】/, '');
+    
+    if (srcBaseName === noteTitle) {
+      new Notice('【Note】プレフィックスがありません: ' + noteTitle);
+      return;
+    }
+
+    // 対応するPDFのファイル名
+    const targetPdfName = `${srcBaseName}.pdf`;
+    
+    // Vault内からPDFを検索
+    const pdfFile = this.app.vault.getFiles().find(
+      file => file.name === targetPdfName
+    );
+
+    // 出力先のフルパスを構築
+    const mdFolder = this.settings.markdownOutputFolder.trim();
+    const targetMdName = `${srcBaseName}.md`;
+    const targetMdPath = mdFolder ? `${mdFolder}/${targetMdName}` : targetMdName;
+
+    // OCR済みMarkdownが存在するかチェック
+    let srcFile = this.app.vault.getAbstractFileByPath(targetMdPath) as TFile | null;
+
+    // Markdownが存在しない場合、PDFをOCR処理
+    if (!srcFile) {
+      if (!pdfFile) {
+        new Notice(`PDF not found: ${targetPdfName}`);
+        return;
+      }
+
+      new Notice(`OCR処理を開始: ${targetPdfName}`);
+      try {
+        await this.processPDFfromTFile(pdfFile);
+      } catch (err) {
+        console.error(err);
+        new Notice(`Failed to process: ${targetPdfName}`);
+        return;
+      }
+
+      // 処理後にファイルを再取得
+      srcFile = this.app.vault.getAbstractFileByPath(targetMdPath) as TFile | null;
+      if (!srcFile) {
+        new Notice('OCR処理後もMarkdownファイルが見つかりません');
+        return;
+      }
+    }
+
+    // 要約元の内容を読み取る
+    const srcContent = await this.app.vault.read(srcFile);
+
+    // 要約先ノート（現在のノート）の内容を読み取る
+    let noteContent = await this.app.vault.read(activeFile);
+
+    // <!-- キー --> を全て抽出
+    const commentRegex = /<!--\s*([\s\S]*?)\s*-->/g;
+    const allMatches = [...noteContent.matchAll(commentRegex)];
+
+    // ノート内のコメントからキーのセットを作成
+    const keysInNote = new Set(allMatches.map(match => match[1].trim()));
+
+    // 設定からプロンプトマップを作成
+    const promptMap: { [key: string]: string } = {};
+    for (const item of this.settings.summaryPrompts) {
+      promptMap[item.keyComment] = item.prompt;
+    }
+
+    // プロンプト設定の各キーがノート内に存在するかチェック
+    const keysToProcess = Object.keys(promptMap).filter(key => keysInNote.has(key));
+
+    if (keysToProcess.length === 0) {
+      const availableKeys = Object.keys(promptMap).join(', ');
+      new Notice(`有効なキーが見つかりません。使用可能: ${availableKeys}`);
+      return;
+    }
+
+    // 対応するmatchオブジェクトを取得（置換用）
+    const validMatches: { fullMatch: string; key: string }[] = [];
+    for (const key of keysToProcess) {
+      const match = allMatches.find(m => m[1].trim() === key);
+      if (match) {
+        validMatches.push({ fullMatch: match[0], key: match[1].trim() });
+      }
+    }
+
+    // Text Generator プラグインを取得
+    const tg = (this.app as any).plugins.getPlugin('obsidian-textgenerator-plugin');
+    if (!tg) {
+      new Notice('Text Generator プラグインが見つかりません');
+      return;
+    }
+
+    new Notice(`AI要約を開始: ${validMatches.length}件のキーを処理`);
+
+    // 各キーを処理
+    for (const matchInfo of validMatches) {
+      const fullComment = matchInfo.fullMatch;       // <!-- キー --> 全体
+      const key = matchInfo.key;                     // キー名
+      const userInstruction = promptMap[key];        // 対応するプロンプト
+
+      // プロンプト作成（定義済みプロンプト + 要約元の内容）
+      const promptText = `${userInstruction}\n\n---\n\n${srcContent}`;
+
+      // AI 要約を生成
+      let result;
+      try {
+        result = await tg.pluginAPIService.gen(promptText);
+      } catch (e: any) {
+        new Notice('APIエラー: ' + (e.message || e));
+        return;
+      }
+
+      // 結果を取得
+      const summaryText = result?.text ?? result?.content ?? result ?? '';
+
+      // コメント部分を要約で置き換え
+      noteContent = noteContent.replace(fullComment, summaryText);
+    }
+
+    // 全ての置換が終わったらファイルを保存
+    await this.app.vault.modify(activeFile, noteContent);
+    new Notice(`要約が完了しました！（${validMatches.length}件処理）`);
   }
 }
 
@@ -551,5 +723,123 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
                     }
                 });
         });
+
+    // AI要約プロンプト設定セクション
+    containerEl.createEl('h3', { text: 'AI Summary Prompts' });
+    containerEl.createEl('p', { 
+      text: 'ノート内の <!-- Key Comment --> をAIで置き換える際のプロンプトを設定します。',
+      cls: 'setting-item-description'
+    });
+
+    // プロンプト一覧を表示するコンテナ
+    const promptsContainer = containerEl.createDiv({ cls: 'summary-prompts-container' });
+    
+    this.renderPromptsList(promptsContainer);
+
+    // 新規プロンプト追加ボタン
+    new Setting(containerEl)
+      .setName('Add New Prompt')
+      .setDesc('新しいKey CommentとPromptのペアを追加します')
+      .addButton(button => {
+        button
+          .setButtonText('+ Add Prompt')
+          .setCta()
+          .onClick(async () => {
+            this.plugin.settings.summaryPrompts.push({
+              keyComment: '',
+              prompt: ''
+            });
+            await this.plugin.saveSettings();
+            this.renderPromptsList(promptsContainer);
+          });
+      });
+
+    // デフォルトにリセットボタン
+    new Setting(containerEl)
+      .setName('Reset to Defaults')
+      .setDesc('プロンプト設定をデフォルトに戻します')
+      .addButton(button => {
+        button
+          .setButtonText('Reset')
+          .setWarning()
+          .onClick(async () => {
+            this.plugin.settings.summaryPrompts = [...DEFAULT_SUMMARY_PROMPTS];
+            await this.plugin.saveSettings();
+            this.renderPromptsList(promptsContainer);
+            new Notice('プロンプト設定をデフォルトにリセットしました');
+          });
+      });
+  }
+
+  /**
+   * プロンプト一覧をレンダリング
+   */
+  renderPromptsList(container: HTMLElement): void {
+    container.empty();
+
+    if (this.plugin.settings.summaryPrompts.length === 0) {
+      container.createEl('p', { 
+        text: 'プロンプトが設定されていません。「Add Prompt」で追加してください。',
+        cls: 'setting-item-description'
+      });
+      return;
+    }
+
+    this.plugin.settings.summaryPrompts.forEach((promptItem, index) => {
+      const itemContainer = container.createDiv({ cls: 'summary-prompt-item' });
+      itemContainer.style.marginBottom = '1.5em';
+      itemContainer.style.padding = '1em';
+      itemContainer.style.border = '1px solid var(--background-modifier-border)';
+      itemContainer.style.borderRadius = '8px';
+
+      // ヘッダー（番号と削除ボタン）
+      const headerDiv = itemContainer.createDiv();
+      headerDiv.style.display = 'flex';
+      headerDiv.style.justifyContent = 'space-between';
+      headerDiv.style.alignItems = 'center';
+      headerDiv.style.marginBottom = '0.5em';
+
+      headerDiv.createEl('strong', { text: `Prompt #${index + 1}` });
+
+      const deleteBtn = headerDiv.createEl('button', { text: 'Delete' });
+      deleteBtn.style.color = 'var(--text-error)';
+      deleteBtn.addEventListener('click', async () => {
+        this.plugin.settings.summaryPrompts.splice(index, 1);
+        await this.plugin.saveSettings();
+        this.renderPromptsList(container);
+      });
+
+      // Key Comment入力
+      const keyCommentSetting = new Setting(itemContainer)
+        .setName('Key Comment')
+        .setDesc('ノート内で使用するコメントキー（例: 研究が行われた背景と主な目的について）');
+      
+      const keyCommentInput = keyCommentSetting.controlEl.createEl('textarea');
+      keyCommentInput.value = promptItem.keyComment;
+      keyCommentInput.placeholder = '例: 研究が行われた背景と主な目的について';
+      keyCommentInput.style.width = '100%';
+      keyCommentInput.style.minHeight = '60px';
+      keyCommentInput.style.resize = 'vertical';
+      keyCommentInput.addEventListener('change', async () => {
+        this.plugin.settings.summaryPrompts[index].keyComment = keyCommentInput.value;
+        await this.plugin.saveSettings();
+      });
+
+      // Prompt入力
+      const promptSetting = new Setting(itemContainer)
+        .setName('Prompt')
+        .setDesc('AIに送信するプロンプト文');
+      
+      const promptInput = promptSetting.controlEl.createEl('textarea');
+      promptInput.value = promptItem.prompt;
+      promptInput.placeholder = '例: この研究が行われた背景と主な目的について詳細に教えてください。';
+      promptInput.style.width = '100%';
+      promptInput.style.minHeight = '80px';
+      promptInput.style.resize = 'vertical';
+      promptInput.addEventListener('change', async () => {
+        this.plugin.settings.summaryPrompts[index].prompt = promptInput.value;
+        await this.plugin.saveSettings();
+      });
+    });
   }
 }
