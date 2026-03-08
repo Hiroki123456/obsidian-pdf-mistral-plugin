@@ -355,6 +355,16 @@ export default class PDFToMarkdownPlugin extends Plugin {
     await this.app.vault.adapter.writeBinary(filePath, arrayBuffer);
   }
 
+  /**
+   * Text Generator 側でテンプレート構文として誤解されやすい
+   * 二重波括弧を、送信用の文字列だけ安全化する。
+   */
+  sanitizeForPrompt(text: string): string {
+    return text
+      .replace(/\{\{/g, '{ {')
+      .replace(/\}\}/g, '} }');
+  }
+
   async loadSettings() {
     const savedData = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, savedData);
@@ -433,8 +443,9 @@ export default class PDFToMarkdownPlugin extends Plugin {
       }
     }
 
-    // 要約元の内容を読み取る
+    // 要約元の内容を読み取り、送信用にだけ安全化する
     const srcContent = await this.app.vault.read(srcFile);
+    const sanitizedSrcContent = this.sanitizeForPrompt(srcContent);
 
     // 要約先ノート（現在のノート）の内容を読み取る
     let noteContent = await this.app.vault.read(activeFile);
@@ -508,18 +519,18 @@ export default class PDFToMarkdownPlugin extends Plugin {
       
       if (i === 0) {
         // 最初のプロンプト：PDF内容をコンテキストとして含める
-        promptText = `${systemPromptSection}以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${srcContent}\n---\n\n【質問】\n${userInstruction}`;
+        promptText = `${systemPromptSection}以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${sanitizedSrcContent}\n---\n\n【質問】\n${this.sanitizeForPrompt(userInstruction)}`;
       } else {
         // 2番目以降：会話履歴を含めて送信
         let historyText = `${systemPromptSection}以下はこれまでの会話履歴です。この文脈を踏まえて次の質問に回答してください。\n\n`;
         for (const msg of conversationHistory) {
           if (msg.role === 'user') {
-            historyText += `【質問】\n${msg.content}\n\n`;
+            historyText += `【質問】\n${this.sanitizeForPrompt(msg.content)}\n\n`;
           } else {
-            historyText += `【回答】\n${msg.content}\n\n`;
+            historyText += `【回答】\n${this.sanitizeForPrompt(msg.content)}\n\n`;
           }
         }
-        historyText += `---\n\n【次の質問】\n${userInstruction}`;
+        historyText += `---\n\n【次の質問】\n${this.sanitizeForPrompt(userInstruction)}`;
         promptText = historyText;
       }
 
