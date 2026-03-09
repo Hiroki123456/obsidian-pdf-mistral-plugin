@@ -356,13 +356,26 @@ export default class PDFToMarkdownPlugin extends Plugin {
   }
 
   /**
-   * Text Generator 側でテンプレート構文として誤解されやすい
-   * 二重波括弧を、送信用の文字列だけ安全化する。
+   * Text Generator 内部の Handlebars テンプレートパーサとの衝突を防ぐため、
+   * 送信用テキストだけを安全化する。元ファイルは変更しない。
+   *  - \rm{...} → \mathrm{...}  (古い LaTeX 命令を現代的な形に置換し {変数} 誤認を防止)
+   *  - {{ / }} を空白で分離  ({{{ 等の三連以上にも対応)
    */
   sanitizeForPrompt(text: string): string {
-    return text
-      .replace(/\{\{/g, '{ {')
-      .replace(/\}\}/g, '} }');
+    let result = text;
+
+    // \rm{...} は Handlebars に {変数} と誤認されやすいので \mathrm{...} に置換
+    result = result.replace(/\\rm\{/g, '\\mathrm{');
+
+    // {{ / }} を空白で分離 (三連以上の波括弧も繰り返しで解消)
+    while (result.includes('{{')) {
+      result = result.replace(/\{\{/g, '{ {');
+    }
+    while (result.includes('}}')) {
+      result = result.replace(/\}\}/g, '} }');
+    }
+
+    return result;
   }
 
   async loadSettings() {
