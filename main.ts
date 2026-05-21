@@ -460,8 +460,8 @@ export default class PDFToMarkdownPlugin extends Plugin {
     const srcContent = await this.app.vault.read(srcFile);
     const sanitizedSrcContent = this.sanitizeForPrompt(srcContent);
 
-    // 要約先ノート（現在のノート）の内容を読み取る
-    let noteContent = await this.app.vault.read(activeFile);
+    // 要約先ノート（現在のノート）の内容を読み取る（コメント抽出用のスナップショット）
+    const noteContent = await this.app.vault.read(activeFile);
 
     // <!-- キー --> を全て抽出
     const commentRegex = /<!--\s*([\s\S]*?)\s*-->/g;
@@ -505,6 +505,9 @@ export default class PDFToMarkdownPlugin extends Plugin {
 
     // 会話履歴を保持（マルチターン会話用）
     const conversationHistory: { role: 'user' | 'assistant'; content: string }[] = [];
+
+    // AI生成結果を蓄積（ループ内ではファイルに書き込まず、最後にまとめて適用する）
+    const replacements: { fullComment: string; summaryText: string }[] = [];
 
     // 設定のプロンプト順序を維持するため、設定順にvalidMatchesをソート
     const promptOrder = this.settings.summaryPrompts.map(p => p.keyComment);
@@ -563,12 +566,19 @@ export default class PDFToMarkdownPlugin extends Plugin {
       conversationHistory.push({ role: 'user', content: userInstruction });
       conversationHistory.push({ role: 'assistant', content: summaryText });
 
-      // コメント部分を要約で置き換え
-      noteContent = noteContent.replace(fullComment, summaryText);
+      // 置換内容を蓄積（このタイミングではファイルに触らない）
+      replacements.push({ fullComment, summaryText });
     }
 
-    // 全ての置換が終わったらファイルを保存
-    await this.app.vault.modify(activeFile, noteContent);
+    // 書き込み直前にファイルを再読込し、最新内容に対して置換を適用（ユーザーの追記を保持）
+    // 第2引数を関数にすることで summaryText 内の $$ や $& 等の特殊置換パターン解釈を回避
+    await this.app.vault.process(activeFile, (latestContent) => {
+      let result = latestContent;
+      for (const { fullComment, summaryText } of replacements) {
+        result = result.replace(fullComment, () => summaryText);
+      }
+      return result;
+    });
     new Notice(`要約が完了しました！（${validMatches.length}件を会話形式で処理）`);
   }
 }
