@@ -1,6 +1,7 @@
 import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, Modal } from 'obsidian';
 import { Buffer } from 'buffer';
 import { Mistral } from '@mistralai/mistralai';
+import { spawn } from 'child_process';
 
 /**
  * OCR 結果の pages[].images[].id と、そのBase64画像データ(imageBase64)を扱う想定。
@@ -37,6 +38,17 @@ interface PDFToMarkdownSettings {
   // 一括処理時の最大並列実行数
   parallelProcessingLimit: number;
 
+  // AI要約に使用するエンジン
+  // 'textgenerator': Text Generator プラグイン経由（従来）
+  // 'claudecode': ローカルの Claude Code CLI をサブプロセス起動
+  summaryProvider: 'textgenerator' | 'claudecode';
+
+  // Claude Code CLI の実行ファイルパス（PATHが通っていれば 'claude' のままでよい）
+  claudeCodePath: string;
+
+  // Claude Code で使用するモデル（空欄ならCLIの既定モデル）
+  claudeCodeModel: string;
+
   // AI要約用のシステムプロンプト（全プロンプト共通の指示）
   summarySystemPrompt: string;
 
@@ -64,6 +76,9 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   imagesFolderName: 'pdf-mistral-images',
   mistralApiKey: '',
   parallelProcessingLimit: 3,
+  summaryProvider: 'textgenerator',
+  claudeCodePath: 'claude',
+  claudeCodeModel: '',
   summarySystemPrompt: '見出し記号（#）は使わずに回答してください。\n前置き文（「〜について説明します」「以下に述べます」など）は省略し、直接内容を回答してください。',
   summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
@@ -378,6 +393,77 @@ export default class PDFToMarkdownPlugin extends Plugin {
     return result;
   }
 
+  /**
+   * ローカルの Claude Code CLI をサブプロセスとして起動し、プロンプトに対する応答テキストを得る。
+   * - 認証はユーザーの既存CLIログイン（Pro/Maxサブスク等）に委ねるため、追加のAPI課金は発生しない。
+   * - プロンプトは長文（OCR全文）になり得るため、コマンド引数ではなく stdin で渡す（ARG_MAX回避）。
+   * - `--output-format json` の構造化出力から result フィールドを取り出す。
+   */
+  async generateWithClaudeCode(promptText: string): Promise<string> {
+    const cliPath = (this.settings.claudeCodePath || 'claude').trim() || 'claude';
+    const model = (this.settings.claudeCodeModel || '').trim();
+
+    // Vaultのルートを作業ディレクトリにする（取得できなければ未指定）
+    let cwd: string | undefined = undefined;
+    const adapter: any = this.app.vault.adapter;
+    if (adapter && typeof adapter.basePath === 'string') {
+      cwd = adapter.basePath;
+    }
+
+    const args = ['-p', '--output-format', 'json'];
+    if (model) {
+      args.push('--model', model);
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      let child;
+      try {
+        child = spawn(cliPath, args, { cwd, env: process.env });
+      } catch (e: any) {
+        reject(new Error(`Claude CLIの起動に失敗しました: ${e.message || e}`));
+        return;
+      }
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+      child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+
+      child.on('error', (err: any) => {
+        // ENOENT 等。CLIパス設定の確認を促す
+        reject(new Error(`Claude CLIを実行できません（パス: "${cliPath}"）: ${err.message || err}`));
+      });
+
+      child.on('close', (code: number) => {
+        if (code !== 0) {
+          reject(new Error(`Claude CLIが異常終了しました (code ${code}): ${stderr.slice(0, 300)}`));
+          return;
+        }
+        // JSON出力をパースして result を取り出す
+        try {
+          const json = JSON.parse(stdout);
+          if (json.is_error) {
+            reject(new Error(`Claude CLIがエラーを返しました: ${json.result || 'unknown error'}`));
+            return;
+          }
+          resolve(typeof json.result === 'string' ? json.result : String(json.result ?? ''));
+        } catch (e: any) {
+          // 万一JSONでなければ素のテキストとして扱う
+          if (stdout.trim()) {
+            resolve(stdout.trim());
+          } else {
+            reject(new Error(`Claude CLI出力の解析に失敗しました: ${e.message || e}`));
+          }
+        }
+      });
+
+      // プロンプトを stdin で渡す
+      child.stdin.write(promptText);
+      child.stdin.end();
+    });
+  }
+
   async loadSettings() {
     const savedData = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, savedData);
@@ -494,14 +580,21 @@ export default class PDFToMarkdownPlugin extends Plugin {
       }
     }
 
-    // Text Generator プラグインを取得
-    const tg = (this.app as any).plugins.getPlugin('obsidian-textgenerator-plugin');
-    if (!tg) {
-      new Notice('Text Generator プラグインが見つかりません');
-      return;
+    // 使用するエンジンを決定
+    const provider = this.settings.summaryProvider;
+
+    // Text Generator を使う場合のみプラグインを取得
+    let tg: any = null;
+    if (provider === 'textgenerator') {
+      tg = (this.app as any).plugins.getPlugin('obsidian-textgenerator-plugin');
+      if (!tg) {
+        new Notice('Text Generator プラグインが見つかりません');
+        return;
+      }
     }
 
-    new Notice(`AI要約を開始: ${validMatches.length}件のキーを会話形式で処理`);
+    const providerLabel = provider === 'claudecode' ? 'Claude Code' : 'Text Generator';
+    new Notice(`AI要約を開始 (${providerLabel}): ${validMatches.length}件のキーを会話形式で処理`);
 
     // 会話履歴を保持（マルチターン会話用）
     const conversationHistory: { role: 'user' | 'assistant'; content: string }[] = [];
@@ -550,17 +643,19 @@ export default class PDFToMarkdownPlugin extends Plugin {
         promptText = historyText;
       }
 
-      // AI 要約を生成
-      let result;
+      // AI 要約を生成（エンジンに応じて分岐。どちらも「プロンプト→テキスト」の同一インターフェース）
+      let summaryText: string;
       try {
-        result = await tg.pluginAPIService.gen(promptText);
+        if (provider === 'claudecode') {
+          summaryText = await this.generateWithClaudeCode(promptText);
+        } else {
+          const result = await tg.pluginAPIService.gen(promptText);
+          summaryText = result?.text ?? result?.content ?? result ?? '';
+        }
       } catch (e: any) {
         new Notice('APIエラー: ' + (e.message || e));
         return;
       }
-
-      // 結果を取得
-      const summaryText = result?.text ?? result?.content ?? result ?? '';
 
       // 会話履歴に追加（次のプロンプトで使用）
       conversationHistory.push({ role: 'user', content: userInstruction });
@@ -811,10 +906,54 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
 
     // AI要約プロンプト設定セクション
     containerEl.createEl('h3', { text: 'AI Summary Prompts' });
-    containerEl.createEl('p', { 
+    containerEl.createEl('p', {
       text: 'ノート内の <!-- Key Comment --> をAIで置き換える際のプロンプトを設定します。',
       cls: 'setting-item-description'
     });
+
+    // 要約エンジンの選択
+    new Setting(containerEl)
+      .setName('Summary Provider')
+      .setDesc('要約に使用するエンジン。Text Generator（従来）／ Claude Code CLI（ローカルのclaudeを起動。サブスクログイン利用で追加API課金なし）')
+      .addDropdown(dd => {
+        dd.addOption('textgenerator', 'Text Generator (従来)');
+        dd.addOption('claudecode', 'Claude Code CLI');
+        dd.setValue(this.plugin.settings.summaryProvider);
+        dd.onChange(async (value) => {
+          this.plugin.settings.summaryProvider = value as 'textgenerator' | 'claudecode';
+          await this.plugin.saveSettings();
+          this.display(); // 条件付き設定の表示を切り替えるため再描画
+        });
+      });
+
+    // Claude Code を選択した場合のみ表示する追加設定
+    if (this.plugin.settings.summaryProvider === 'claudecode') {
+      new Setting(containerEl)
+        .setName('Claude CLI Path')
+        .setDesc('claude 実行ファイルのパス。PATHが通っていれば "claude" のままでOK。nvm/fnm/volta等で見つからない場合は絶対パスを指定（例: /Users/you/.local/bin/claude）')
+        .addText(text => {
+          text
+            .setPlaceholder('claude')
+            .setValue(this.plugin.settings.claudeCodePath)
+            .onChange(async (value) => {
+              this.plugin.settings.claudeCodePath = value.trim() || 'claude';
+              await this.plugin.saveSettings();
+            });
+        });
+
+      new Setting(containerEl)
+        .setName('Claude Model (任意)')
+        .setDesc('使用するモデル。空欄ならCLIの既定モデル。例: opus, sonnet, claude-opus-4-8')
+        .addText(text => {
+          text
+            .setPlaceholder('(default)')
+            .setValue(this.plugin.settings.claudeCodeModel)
+            .onChange(async (value) => {
+              this.plugin.settings.claudeCodeModel = value.trim();
+              await this.plugin.saveSettings();
+            });
+        });
+    }
 
     // システムプロンプト設定
     const systemPromptSetting = new Setting(containerEl)
