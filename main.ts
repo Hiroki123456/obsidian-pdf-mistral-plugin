@@ -2,6 +2,7 @@ import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, Modal } from 'ob
 import { Buffer } from 'buffer';
 import { Mistral } from '@mistralai/mistralai';
 import { spawn } from 'child_process';
+import { tmpdir } from 'os';
 
 /**
  * OCR 結果の pages[].images[].id と、そのBase64画像データ(imageBase64)を扱う想定。
@@ -399,20 +400,24 @@ export default class PDFToMarkdownPlugin extends Plugin {
    * - プロンプトは長文（OCR全文）になり得るため、コマンド引数ではなく stdin で渡す（ARG_MAX回避）。
    * - `--output-format json` の構造化出力から result フィールドを取り出す。
    */
-  async generateWithClaudeCode(promptText: string): Promise<string> {
+  async generateWithClaudeCode(promptText: string, systemPrompt: string): Promise<string> {
     const cliPath = (this.settings.claudeCodePath || 'claude').trim() || 'claude';
     const model = (this.settings.claudeCodeModel || '').trim();
 
-    // Vaultのルートを作業ディレクトリにする（取得できなければ未指定）
-    let cwd: string | undefined = undefined;
-    const adapter: any = this.app.vault.adapter;
-    if (adapter && typeof adapter.basePath === 'string') {
-      cwd = adapter.basePath;
-    }
+    // 作業ディレクトリは Vault 外の一時ディレクトリにする。
+    // 理由: cwd を Vault ルートにすると Claude Code が Vault 内の CLAUDE.md を
+    // プロジェクトメモリとして自動読み込みし、要約の指示に干渉するため。
+    // 要約は文書全文をプロンプトに含めるので Vault 内ファイルへのアクセスは不要。
+    const cwd: string = tmpdir();
 
     const args = ['-p', '--output-format', 'json'];
     if (model) {
       args.push('--model', model);
+    }
+    // 要約用の指示は「本物のシステムプロンプト」として渡し、
+    // Claude Code 既定のエージェントプロンプトより優先させる。
+    if (systemPrompt) {
+      args.push('--system-prompt', systemPrompt);
     }
 
     return new Promise<string>((resolve, reject) => {
@@ -621,7 +626,9 @@ export default class PDFToMarkdownPlugin extends Plugin {
 
       // システムプロンプトを取得
       const systemPrompt = this.settings.summarySystemPrompt.trim();
-      const systemPromptSection = systemPrompt ? `【指示】\n${systemPrompt}\n\n` : '';
+      // Claude Code では本物のシステムプロンプト(--system-prompt)として渡すため本文には埋め込まない。
+      // Text Generator は gen() にシステムロールが無いので従来どおり本文冒頭へ埋め込む。
+      const systemPromptSection = (provider !== 'claudecode' && systemPrompt) ? `【指示】\n${systemPrompt}\n\n` : '';
 
       // プロンプトを構築
       let promptText: string;
@@ -647,7 +654,7 @@ export default class PDFToMarkdownPlugin extends Plugin {
       let summaryText: string;
       try {
         if (provider === 'claudecode') {
-          summaryText = await this.generateWithClaudeCode(promptText);
+          summaryText = await this.generateWithClaudeCode(promptText, systemPrompt);
         } else {
           const result = await tg.pluginAPIService.gen(promptText);
           summaryText = result?.text ?? result?.content ?? result ?? '';
