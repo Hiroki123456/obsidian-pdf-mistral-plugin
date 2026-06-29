@@ -914,9 +914,9 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
     // 要約エンジンの選択
     new Setting(containerEl)
       .setName('Summary Provider')
-      .setDesc('要約に使用するエンジン。Text Generator（従来）／ Claude Code CLI（ローカルのclaudeを起動。サブスクログイン利用で追加API課金なし）')
+      .setDesc('要約に使用するエンジン。Text Generator ／ Claude Code CLI（ローカルのclaudeを起動。サブスクログイン利用で追加API課金なし）')
       .addDropdown(dd => {
-        dd.addOption('textgenerator', 'Text Generator (従来)');
+        dd.addOption('textgenerator', 'Text Generator');
         dd.addOption('claudecode', 'Claude Code CLI');
         dd.setValue(this.plugin.settings.summaryProvider);
         dd.onChange(async (value) => {
