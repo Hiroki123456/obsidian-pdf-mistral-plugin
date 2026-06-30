@@ -50,6 +50,15 @@ interface PDFToMarkdownSettings {
   // Claude Code で使用するモデル（空欄ならCLIの既定モデル）
   claudeCodeModel: string;
 
+  // Claude Code の工数(effort)。空欄なら --effort を渡さず Claude Code 側の設定/既定に委ねる。
+  // 値: '' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  claudeCodeEffort: string;
+
+  // Claude Code でのマルチキー処理方式
+  // 'independent': 各キーを独立実行（文書を毎回渡す・並列実行）= 案B
+  // 'session': 永続セッション(--resume)で文書・文脈を共有（逐次実行）= 案C
+  claudeCodeMultiKeyMode: 'independent' | 'session';
+
   // AI要約用のシステムプロンプト（全プロンプト共通の指示）
   summarySystemPrompt: string;
 
@@ -80,6 +89,8 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   summaryProvider: 'textgenerator',
   claudeCodePath: 'claude',
   claudeCodeModel: '',
+  claudeCodeEffort: '',
+  claudeCodeMultiKeyMode: 'independent',
   summarySystemPrompt: '見出し記号（#）は使わずに回答してください。\n前置き文（「〜について説明します」「以下に述べます」など）は省略し、直接内容を回答してください。',
   summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
@@ -400,9 +411,10 @@ export default class PDFToMarkdownPlugin extends Plugin {
    * - プロンプトは長文（OCR全文）になり得るため、コマンド引数ではなく stdin で渡す（ARG_MAX回避）。
    * - `--output-format json` の構造化出力から result フィールドを取り出す。
    */
-  async generateWithClaudeCode(promptText: string, systemPrompt: string): Promise<string> {
+  async generateWithClaudeCode(promptText: string, systemPrompt: string, resumeSessionId?: string): Promise<{ text: string; sessionId: string }> {
     const cliPath = (this.settings.claudeCodePath || 'claude').trim() || 'claude';
     const model = (this.settings.claudeCodeModel || '').trim();
+    const effort = (this.settings.claudeCodeEffort || '').trim();
 
     // 作業ディレクトリは Vault 外の一時ディレクトリにする。
     // 理由: cwd を Vault ルートにすると Claude Code が Vault 内の CLAUDE.md を
@@ -411,16 +423,27 @@ export default class PDFToMarkdownPlugin extends Plugin {
     const cwd: string = tmpdir();
 
     const args = ['-p', '--output-format', 'json'];
-    if (model) {
-      args.push('--model', model);
+    if (resumeSessionId) {
+      // 既存セッションを継続（案C）。モデル・システムプロンプト・文書は
+      // セッションに保持されているため再指定しない。
+      args.push('--resume', resumeSessionId);
+    } else {
+      if (model) {
+        args.push('--model', model);
+      }
+      // 要約用の指示は「本物のシステムプロンプト」として渡し、
+      // Claude Code 既定のエージェントプロンプトより優先させる。
+      if (systemPrompt) {
+        args.push('--system-prompt', systemPrompt);
+      }
     }
-    // 要約用の指示は「本物のシステムプロンプト」として渡し、
-    // Claude Code 既定のエージェントプロンプトより優先させる。
-    if (systemPrompt) {
-      args.push('--system-prompt', systemPrompt);
+    // 工数(effort)は各リクエストの思考深度を制御するため、新規・継続いずれにも付与する。
+    // 空欄なら付与せず Claude Code 側の設定/既定に委ねる。
+    if (effort) {
+      args.push('--effort', effort);
     }
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ text: string; sessionId: string }>((resolve, reject) => {
       let child;
       try {
         child = spawn(cliPath, args, { cwd, env: process.env });
@@ -452,11 +475,13 @@ export default class PDFToMarkdownPlugin extends Plugin {
             reject(new Error(`Claude CLIがエラーを返しました: ${json.result || 'unknown error'}`));
             return;
           }
-          resolve(typeof json.result === 'string' ? json.result : String(json.result ?? ''));
+          const text = typeof json.result === 'string' ? json.result : String(json.result ?? '');
+          const sessionId = typeof json.session_id === 'string' ? json.session_id : '';
+          resolve({ text, sessionId });
         } catch (e: any) {
-          // 万一JSONでなければ素のテキストとして扱う
+          // 万一JSONでなければ素のテキストとして扱う（session_idは取得不可）
           if (stdout.trim()) {
-            resolve(stdout.trim());
+            resolve({ text: stdout.trim(), sessionId: '' });
           } else {
             reject(new Error(`Claude CLI出力の解析に失敗しました: ${e.message || e}`));
           }
@@ -599,12 +624,12 @@ export default class PDFToMarkdownPlugin extends Plugin {
     }
 
     const providerLabel = provider === 'claudecode' ? 'Claude Code' : 'Text Generator';
-    new Notice(`AI要約を開始 (${providerLabel}): ${validMatches.length}件のキーを会話形式で処理`);
 
-    // 会話履歴を保持（マルチターン会話用）
-    const conversationHistory: { role: 'user' | 'assistant'; content: string }[] = [];
+    // 要約用システムプロンプト（Claude Codeは --system-prompt として渡す。
+    // Text Generatorは gen() にシステムロールが無いため本文冒頭へ埋め込む）
+    const systemPrompt = this.settings.summarySystemPrompt.trim();
 
-    // AI生成結果を蓄積（ループ内ではファイルに書き込まず、最後にまとめて適用する）
+    // AI生成結果を蓄積（生成中はファイルに書き込まず、最後にまとめて適用する）
     const replacements: { fullComment: string; summaryText: string }[] = [];
 
     // 設定のプロンプト順序を維持するため、設定順にvalidMatchesをソート
@@ -615,61 +640,67 @@ export default class PDFToMarkdownPlugin extends Plugin {
       return indexA - indexB;
     });
 
-    // 各キーを順番に処理（会話形式）
-    for (let i = 0; i < validMatches.length; i++) {
-      const matchInfo = validMatches[i];
-      const fullComment = matchInfo.fullMatch;       // <!-- キー --> 全体
-      const key = matchInfo.key;                     // キー名
-      const userInstruction = promptMap[key];        // 対応するプロンプト
+    // 全観点の一覧。各回答に「他にどんな観点を作るか」を提示し、内容の重複を防ぐ。
+    const questionList = validMatches
+      .map((m, idx) => `${idx + 1}. ${this.sanitizeForPrompt(promptMap[m.key])}`)
+      .join('\n');
 
-      new Notice(`処理中 (${i + 1}/${validMatches.length}): ${key.substring(0, 30)}...`);
+    // 案B（独立実行）用プロンプト：文書全文＋全観点一覧＋今回の観点
+    const buildIndependentPrompt = (currentInstruction: string, sysSection: string): string => {
+      return `${sysSection}以下の論文/文書について、複数の観点から個別に解説を作成します。各観点は他の観点と内容が重複しないよう、その観点だけに集中して回答してください。\n\n【作成する観点の全体一覧】\n${questionList}\n\n---\n【文書内容】\n${sanitizedSrcContent}\n---\n\n【今回回答する観点】\n${this.sanitizeForPrompt(currentInstruction)}`;
+    };
 
-      // システムプロンプトを取得
-      const systemPrompt = this.settings.summarySystemPrompt.trim();
-      // Claude Code では本物のシステムプロンプト(--system-prompt)として渡すため本文には埋め込まない。
-      // Text Generator は gen() にシステムロールが無いので従来どおり本文冒頭へ埋め込む。
-      const systemPromptSection = (provider !== 'claudecode' && systemPrompt) ? `【指示】\n${systemPrompt}\n\n` : '';
+    // Claude Code で「永続セッション方式(案C)」を使うか
+    const useSession = provider === 'claudecode' && this.settings.claudeCodeMultiKeyMode === 'session';
 
-      // プロンプトを構築
-      let promptText: string;
-      
-      if (i === 0) {
-        // 最初のプロンプト：PDF内容をコンテキストとして含める
-        promptText = `${systemPromptSection}以下の論文/文書の内容を踏まえて質問に回答してください。\n\n---\n【文書内容】\n${sanitizedSrcContent}\n---\n\n【質問】\n${this.sanitizeForPrompt(userInstruction)}`;
-      } else {
-        // 2番目以降：会話履歴を含めて送信
-        let historyText = `${systemPromptSection}以下はこれまでの会話履歴です。この文脈を踏まえて次の質問に回答してください。\n\n`;
-        for (const msg of conversationHistory) {
-          if (msg.role === 'user') {
-            historyText += `【質問】\n${this.sanitizeForPrompt(msg.content)}\n\n`;
+    if (useSession) {
+      // 案C: 最初に文書＋全観点を渡し、以降は --resume で文書・文脈を共有（逐次）。
+      new Notice(`AI要約を開始 (Claude Code / セッション共有): ${validMatches.length}件を逐次処理`);
+      let sessionId = '';
+      for (let i = 0; i < validMatches.length; i++) {
+        const m = validMatches[i];
+        new Notice(`処理中 (${i + 1}/${validMatches.length}): ${m.key.substring(0, 30)}...`);
+        let res: { text: string; sessionId: string };
+        try {
+          if (i === 0 || !sessionId) {
+            // 1回目（または session_id 取得失敗時のフォールバック）：文書＋全観点＋今回の観点
+            res = await this.generateWithClaudeCode(buildIndependentPrompt(promptMap[m.key], ''), systemPrompt);
+            sessionId = res.sessionId;
           } else {
-            historyText += `【回答】\n${this.sanitizeForPrompt(msg.content)}\n\n`;
+            // 2回目以降：セッションを継続し今回の観点だけ送る（文書・前の回答は保持済み）
+            const nextPrompt = `続けて次の観点について回答してください。これまでに作成した観点と内容が重複しないようにしてください。\n\n【今回回答する観点】\n${this.sanitizeForPrompt(promptMap[m.key])}`;
+            res = await this.generateWithClaudeCode(nextPrompt, systemPrompt, sessionId);
           }
+        } catch (e: any) {
+          new Notice('APIエラー: ' + (e.message || e));
+          return;
         }
-        historyText += `---\n\n【次の質問】\n${this.sanitizeForPrompt(userInstruction)}`;
-        promptText = historyText;
+        replacements.push({ fullComment: m.fullMatch, summaryText: res.text });
       }
-
-      // AI 要約を生成（エンジンに応じて分岐。どちらも「プロンプト→テキスト」の同一インターフェース）
-      let summaryText: string;
-      try {
+    } else {
+      // 案B: 各観点を独立実行（文書を毎回渡す）。並列実行で高速化。
+      new Notice(`AI要約を開始 (${providerLabel} / 独立並列): ${validMatches.length}件を並列処理`);
+      const tasks = validMatches.map((m) => async (): Promise<{ fullComment: string; summaryText: string }> => {
+        const sysSection = (provider !== 'claudecode' && systemPrompt) ? `【指示】\n${systemPrompt}\n\n` : '';
+        const prompt = buildIndependentPrompt(promptMap[m.key], sysSection);
+        let summaryText: string;
         if (provider === 'claudecode') {
-          summaryText = await this.generateWithClaudeCode(promptText, systemPrompt);
+          const res = await this.generateWithClaudeCode(prompt, systemPrompt);
+          summaryText = res.text;
         } else {
-          const result = await tg.pluginAPIService.gen(promptText);
+          const result = await tg.pluginAPIService.gen(prompt);
           summaryText = result?.text ?? result?.content ?? result ?? '';
         }
+        return { fullComment: m.fullMatch, summaryText };
+      });
+      let results: { fullComment: string; summaryText: string }[];
+      try {
+        results = await Promise.all(tasks.map(t => t()));
       } catch (e: any) {
         new Notice('APIエラー: ' + (e.message || e));
         return;
       }
-
-      // 会話履歴に追加（次のプロンプトで使用）
-      conversationHistory.push({ role: 'user', content: userInstruction });
-      conversationHistory.push({ role: 'assistant', content: summaryText });
-
-      // 置換内容を蓄積（このタイミングではファイルに触らない）
-      replacements.push({ fullComment, summaryText });
+      for (const r of results) replacements.push(r);
     }
 
     // 書き込み直前にファイルを再読込し、最新内容に対して置換を適用（ユーザーの追記を保持）
@@ -681,7 +712,7 @@ export default class PDFToMarkdownPlugin extends Plugin {
       }
       return result;
     });
-    new Notice(`要約が完了しました！（${validMatches.length}件を会話形式で処理）`);
+    new Notice(`要約が完了しました！（${validMatches.length}件を処理）`);
   }
 }
 
@@ -959,6 +990,36 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
               this.plugin.settings.claudeCodeModel = value.trim();
               await this.plugin.saveSettings();
             });
+        });
+
+      new Setting(containerEl)
+        .setName('Claude Effort (工数)')
+        .setDesc('思考の深さ／トークン消費を制御。「(指定しない)」ならClaude Code側の設定・既定に委ねる（sonnetの既定はhigh）。xhighはOpus専用で、sonnetでは自動的にhighとして動作する。')
+        .addDropdown(dd => {
+          dd.addOption('', '(指定しない)');
+          dd.addOption('low', 'low');
+          dd.addOption('medium', 'medium');
+          dd.addOption('high', 'high');
+          dd.addOption('xhigh', 'xhigh (Opus専用・sonnetはhigh扱い)');
+          dd.addOption('max', 'max');
+          dd.setValue(this.plugin.settings.claudeCodeEffort);
+          dd.onChange(async (value) => {
+            this.plugin.settings.claudeCodeEffort = value;
+            await this.plugin.saveSettings();
+          });
+        });
+
+      new Setting(containerEl)
+        .setName('Multi-Key Mode')
+        .setDesc('複数の観点を処理する方式。独立並列(案B)＝各観点に文書を毎回渡し並列実行（速い）。セッション共有(案C)＝最初に文書を渡し以降は同一セッションを継続し文脈・前の回答も共有（重複が少なく正確だが逐次で遅い）。')
+        .addDropdown(dd => {
+          dd.addOption('independent', '独立並列 (案B・速い)');
+          dd.addOption('session', 'セッション共有 (案C・高精度)');
+          dd.setValue(this.plugin.settings.claudeCodeMultiKeyMode);
+          dd.onChange(async (value) => {
+            this.plugin.settings.claudeCodeMultiKeyMode = value as 'independent' | 'session';
+            await this.plugin.saveSettings();
+          });
         });
     }
 
