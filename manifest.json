@@ -1,7 +1,7 @@
 {
 	"id": "pdf-mistral-plugin-autodetect",
 	"name": "pdf-mistral Plugin (Auto Detect)",
-	"version": "1.0.1",
+	"version": "1.0.8",
 	"minAppVersion": "0.15.0",
 	"description": "PDF to Markdown converter using Mistral OCR with Meta Bind support",
 	"author": "Obsidian (Modified by Hiroki)",
