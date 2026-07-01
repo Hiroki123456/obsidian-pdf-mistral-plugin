@@ -91,7 +91,23 @@ const DEFAULT_SETTINGS: PDFToMarkdownSettings = {
   claudeCodeModel: '',
   claudeCodeEffort: '',
   claudeCodeMultiKeyMode: 'independent',
-  summarySystemPrompt: '見出し記号（#）は使わずに回答してください。\n前置き文（「〜について説明します」「以下に述べます」など）は省略し、直接内容を回答してください。',
+  summarySystemPrompt: `あなたは学術論文を精読し、専門家向けに正確な要約を作成するアシスタントである。入力はPDFをOCR変換したテキストである。以下に厳密に従うこと。
+
+【内容の正確性】
+- 提示された論文本文に書かれている情報のみに基づく。記載のない事実を補ったり、一般論で水増ししたりしない。論文に記載がない事項は「言及なし」と明示する。
+- サンプル数・効果量・p値・精度・手法名・データセット名・固有名詞などの具体的情報は原文から正確に引用し、可能な限り数値を含める。
+- OCR由来で数式・表・記号が崩れている場合がある。文脈から合理的に補って解釈してよいが、判読不能で不確実な箇所は断定しない。
+
+【文体】
+- 「だ・である」調で、簡潔かつ論理的に記述する。
+- 「〜について説明します」等の前置きや「以上より」等の締め文は書かず、直接内容から始める。
+- 「様々な」「重要な役割」等の曖昧な表現を避け、具体的に書く。
+
+【書式（Obsidianノートに挿入される）】
+- 見出し記号(#, ##, ###)は一切使わない。区切りは太字（**...**）や箇条書きで表現する。
+- 区切り線(---, ***, ___ などの水平線)は読みづらくなるため一切使わない。
+- 箇条書きのハイフンの後ろの半角スペースは必ず1つにする。
+- 太字（**）で囲む対象に、全角括弧（）や末尾の「%」を含めない（表示が崩れるため）。括弧を使う場合は半角 ( ) とし、太字にするなら ** の外側に半角スペースを置く。`,
   summaryPrompts: DEFAULT_SUMMARY_PROMPTS,
 };
 
@@ -994,13 +1010,13 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
 
       new Setting(containerEl)
         .setName('Claude Effort (工数)')
-        .setDesc('思考の深さ／トークン消費を制御。「(指定しない)」ならClaude Code側の設定・既定に委ねる（sonnetの既定はhigh）。xhighはOpus専用で、sonnetでは自動的にhighとして動作する。')
+        .setDesc('思考の深さ／トークン消費を制御。default はClaude Code側の設定・既定に委ねる。')
         .addDropdown(dd => {
-          dd.addOption('', '(指定しない)');
+          dd.addOption('', 'default');
           dd.addOption('low', 'low');
           dd.addOption('medium', 'medium');
           dd.addOption('high', 'high');
-          dd.addOption('xhigh', 'xhigh (Opus専用・sonnetはhigh扱い)');
+          dd.addOption('xhigh', 'xhigh');
           dd.addOption('max', 'max');
           dd.setValue(this.plugin.settings.claudeCodeEffort);
           dd.onChange(async (value) => {
@@ -1011,10 +1027,10 @@ class PDFToMarkdownSettingTab extends PluginSettingTab {
 
       new Setting(containerEl)
         .setName('Multi-Key Mode')
-        .setDesc('複数の観点を処理する方式。独立並列(案B)＝各観点に文書を毎回渡し並列実行（速い）。セッション共有(案C)＝最初に文書を渡し以降は同一セッションを継続し文脈・前の回答も共有（重複が少なく正確だが逐次で遅い）。')
+        .setDesc('複数の観点を処理する方式。独立並列＝各観点に文書を毎回渡し並列実行（速い）。セッション共有＝最初に文書を渡し以降は同一セッションを継続し文脈・前の回答も共有（重複が少なく正確だが逐次で遅い）。')
         .addDropdown(dd => {
-          dd.addOption('independent', '独立並列 (案B・速い)');
-          dd.addOption('session', 'セッション共有 (案C・高精度)');
+          dd.addOption('independent', '独立並列（速い）');
+          dd.addOption('session', 'セッション共有（高精度）');
           dd.setValue(this.plugin.settings.claudeCodeMultiKeyMode);
           dd.onChange(async (value) => {
             this.plugin.settings.claudeCodeMultiKeyMode = value as 'independent' | 'session';
